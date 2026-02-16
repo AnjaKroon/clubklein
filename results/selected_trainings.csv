@@ -1,8 +1,8 @@
-training_id,training_time,participants,n_participants
-2,Tuesday 16:00,Noordsij;Start,2
-3,Wednesday 09:30,Boon;Ferro;Start;Thomas;Vijver,5
-5,Thursday 10:15,Boulonois;Ferro,2
-6,Thursday 15:00,Boulonois;Start;Vijver,3
-7,Friday 09:00,Thomas;Vijver,2
-8,Friday 16:00,Boon;Boulonois;Noordsij;Thomas,4
-11,Sunday 09:00,Boon;Ferro;Snelder,3
+training_id,training_time,participants,n_participants,coach
+2,Tuesday 16:00,Start,1,Noordsij
+3,Wednesday 09:30,Boon;Ferro;Start;Thomas,4,Vijver
+5,Thursday 10:15,Boulonois,1,Ferro
+6,Thursday 15:00,Boulonois;Vijver,2,Start
+7,Friday 09:00,Vijver,1,Thomas
+8,Friday 16:00,Boon;Noordsij;Thomas,3,Boulonois
+11,Sunday 09:00,Ferro;Snelder,2,Boon

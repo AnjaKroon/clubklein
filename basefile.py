@@ -32,7 +32,7 @@ RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
 # Hard-coded reference data from the spreadsheet.
 WHATSAPP_MAPW_COUNTS = {
-    "Castelein": 0,
+    "Castelein": 3,
     "Start": 3,
     "Noordsij": 3,
     "Hospers": 2,
@@ -584,7 +584,7 @@ def objective_cost(
         unavoidable_deficit = max(desired_count - u_i[athlete], 0)
         shortage = max(effective_target - y_i[athlete], 0)
         overshoot = max(y_i[athlete] - effective_target, 0)
-        weight = alpha_scale * mapw.get(athlete, 0.0)
+        weight = 1.0
         athlete_penalty += weight * (shortage + overshoot)
         diagnostics[athlete] = {
             "mapw": mapw.get(athlete, 0.0),
@@ -607,7 +607,7 @@ def objective_cost(
     return cost, diagnostics
 
 
-def greedy_optimize(
+def solve_training_selection_milp(
     trainings: Sequence[Training],
     athletes: Sequence[str],
     desired: Dict[str, int],
@@ -619,9 +619,63 @@ def greedy_optimize(
     size_fn: str,
     k_limit: Optional[int],
 ) -> Tuple[List[Training], Dict[str, Dict[str, float]]]:
-    selected: List[Training] = []
-    remaining = list(trainings)
-    best_cost, _ = objective_cost(
+    try:
+        import pulp
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "PuLP is required for the training-selection MILP. Install with `pip install pulp`."
+        ) from exc
+
+    if not trainings:
+        return [], {}
+
+    num_trainings = len(trainings)
+    num_athletes = len(athletes)
+
+    availability = [
+        [1 if athlete in training.participants else 0 for training in trainings]
+        for athlete in athletes
+    ]
+    u_i = [sum(availability[i][t] for t in range(num_trainings)) for i in range(num_athletes)]
+    d_i = [desired.get(athlete, 0) for athlete in athletes]
+    d_eff = [min(d_i[i], u_i[i]) for i in range(num_athletes)]
+
+    n_t = [len(training.participants) for training in trainings]
+    c_t = [compute_pair_count(training, pairs) for training in trainings]
+    size_reward = [size_reward_value(n_t[t], size_fn) for t in range(num_trainings)]
+
+    problem = pulp.LpProblem("training_selection", pulp.LpMinimize)
+    x = [
+        pulp.LpVariable(f"x_{t}", lowBound=0, upBound=1, cat="Binary")
+        for t in range(num_trainings)
+    ]
+    s = [pulp.LpVariable(f"s_{i}", lowBound=0) for i in range(num_athletes)]
+    o = [pulp.LpVariable(f"o_{i}", lowBound=0) for i in range(num_athletes)]
+
+    problem += (
+        alpha_scale * pulp.lpSum(s[i] + o[i] for i in range(num_athletes))
+        - delta_size * pulp.lpSum(size_reward[t] * x[t] for t in range(num_trainings))
+        - gamma_pair * pulp.lpSum(c_t[t] * x[t] for t in range(num_trainings))
+    )
+
+    for i in range(num_athletes):
+        problem += (
+            pulp.lpSum(availability[i][t] * x[t] for t in range(num_trainings)) + s[i] - o[i]
+            == d_eff[i]
+        )
+
+    if k_limit is not None:
+        problem += pulp.lpSum(x) <= k_limit
+
+    solver = pulp.PULP_CBC_CMD(msg=False)
+    problem.solve(solver)
+    if pulp.LpStatus[problem.status] != "Optimal":
+        raise ValueError(
+            f"Training selection MILP did not solve optimally (status={pulp.LpStatus[problem.status]})."
+        )
+
+    selected = [trainings[t] for t in range(num_trainings) if int(pulp.value(x[t])) == 1]
+    _, diagnostics = objective_cost(
         selected,
         trainings,
         athletes,
@@ -633,122 +687,156 @@ def greedy_optimize(
         gamma_pair,
         size_fn,
     )
-
-    while remaining:
-        best_candidate = None
-        best_candidate_cost = best_cost
-        for training in remaining:
-            candidate_selection = selected + [training]
-            cost, _ = objective_cost(
-                candidate_selection,
-                trainings,
-                athletes,
-                desired,
-                mapw,
-                pairs,
-                alpha_scale,
-                delta_size,
-                gamma_pair,
-                size_fn,
-            )
-            if best_candidate is None or cost < best_candidate_cost:
-                best_candidate = training
-                best_candidate_cost = cost
-        if best_candidate is None:
-            break
-        if k_limit is not None and len(selected) >= k_limit:
-            break
-        if best_candidate_cost < best_cost or k_limit is not None:
-            selected.append(best_candidate)
-            remaining.remove(best_candidate)
-            best_cost = best_candidate_cost
-        else:
-            break
-
-    improved = True
-    while improved:
-        improved = False
-        for training in list(selected):
-            if k_limit is not None and len(selected) <= 1:
-                continue
-            candidate_selection = [t for t in selected if t.training_id != training.training_id]
-            cost, _ = objective_cost(
-                candidate_selection,
-                trainings,
-                athletes,
-                desired,
-                mapw,
-                pairs,
-                alpha_scale,
-                delta_size,
-                gamma_pair,
-                size_fn,
-            )
-            if cost < best_cost:
-                selected = candidate_selection
-                best_cost = cost
-                improved = True
-                break
-        if improved:
-            continue
-        for training_out in list(selected):
-            for training_in in trainings:
-                if training_in in selected:
-                    continue
-                candidate_selection = [
-                    t for t in selected if t.training_id != training_out.training_id
-                ] + [training_in]
-                if k_limit is not None and len(candidate_selection) > k_limit:
-                    continue
-                cost, _ = objective_cost(
-                    candidate_selection,
-                    trainings,
-                    athletes,
-                    desired,
-                    mapw,
-                    pairs,
-                    alpha_scale,
-                    delta_size,
-                    gamma_pair,
-                    size_fn,
-                )
-                if cost < best_cost:
-                    selected = candidate_selection
-                    best_cost = cost
-                    improved = True
-                    break
-            if improved:
-                break
-
-    final_cost, diagnostics = objective_cost(
-        selected,
-        trainings,
-        athletes,
-        desired,
-        mapw,
-        pairs,
-        alpha_scale,
-        delta_size,
-        gamma_pair,
-        size_fn,
-    )
-    _ = final_cost
     return sorted(selected, key=lambda t: t.training_id), diagnostics
 
 
-def write_selected_trainings_csv(trainings: Sequence[Training]) -> Path:
+def solve_coaching_assignment_milp(
+    availability: Sequence[Sequence[int]],
+    coaches_required: Sequence[int],
+    priority_scores: Sequence[float],
+    pair_split_bonus: Optional[Sequence[Sequence[float]]] = None,
+    alpha: float = 0.0,
+    mu_penalty: float = 0.0,
+    repeat_over_penalty: float = 1.0,
+    one_training_only: Optional[Sequence[int]] = None,
+    pair_indices: Optional[Sequence[Tuple[int, int]]] = None,
+    selected_mask: Optional[Sequence[int]] = None,
+    strict_max_one: bool = False,
+    big_m: Optional[int] = None,
+):
+    """Solve the coaching assignment MILP described in STEP 3."""
+    try:
+        import pulp
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "PuLP is required for the MILP solver. Install with `pip install pulp`."
+        ) from exc
+
+    if not availability:
+        raise ValueError("Availability matrix is empty.")
+    num_athletes = len(availability)
+    num_trainings = len(availability[0])
+    if any(len(row) != num_trainings for row in availability):
+        raise ValueError("Availability matrix rows must have the same length.")
+    if len(coaches_required) != num_trainings:
+        raise ValueError("coaches_required must match number of trainings.")
+    if len(priority_scores) != num_athletes:
+        raise ValueError("priority_scores must match number of athletes.")
+    if selected_mask is None:
+        selected_mask = [1 for _ in range(num_trainings)]
+    if len(selected_mask) != num_trainings:
+        raise ValueError("selected_mask must match number of trainings.")
+
+    if pair_split_bonus is None:
+        pair_split_bonus = [[0.0 for _ in range(num_trainings)] for _ in range(num_athletes)]
+    if len(pair_split_bonus) != num_athletes or any(
+        len(row) != num_trainings for row in pair_split_bonus
+    ):
+        raise ValueError("pair_split_bonus must match availability dimensions.")
+
+    if one_training_only is None:
+        one_training_only = [
+            1 if sum(availability[i][t] for t in range(num_trainings)) == 1 else 0
+            for i in range(num_athletes)
+        ]
+    if len(one_training_only) != num_athletes:
+        raise ValueError("one_training_only must match number of athletes.")
+
+    big_m = num_trainings if big_m is None else big_m
+    if big_m < num_trainings:
+        raise ValueError("big_m must be at least the number of trainings.")
+
+    problem = pulp.LpProblem("coaching_assignment", pulp.LpMaximize)
+    x = [
+        [
+            pulp.LpVariable(f"x_{i}_{t}", lowBound=0, upBound=1, cat="Binary")
+            for t in range(num_trainings)
+        ]
+        for i in range(num_athletes)
+    ]
+    repeat_over = [pulp.LpVariable(f"r_{i}", lowBound=0) for i in range(num_athletes)]
+    if pair_indices is None:
+        pair_indices = []
+
+    problem += (
+        pulp.lpSum(
+            (priority_scores[i] + alpha * pair_split_bonus[i][t]) * x[i][t]
+            for i in range(num_athletes)
+            for t in range(num_trainings)
+        )
+        - mu_penalty
+        * pulp.lpSum(
+            one_training_only[i] * x[i][t]
+            for i in range(num_athletes)
+            for t in range(num_trainings)
+        )
+        - repeat_over_penalty * pulp.lpSum(repeat_over)
+    )
+
+    for t in range(num_trainings):
+        problem += (
+            pulp.lpSum(x[i][t] for i in range(num_athletes))
+            == coaches_required[t] * selected_mask[t]
+        )
+
+    for i in range(num_athletes):
+        for t in range(num_trainings):
+            problem += x[i][t] <= availability[i][t]
+            problem += x[i][t] <= selected_mask[t]
+
+    for i in range(num_athletes):
+        assignments = pulp.lpSum(x[i][t] for t in range(num_trainings))
+        problem += repeat_over[i] >= assignments - 1
+        if strict_max_one:
+            problem += assignments <= 1
+
+    for i, j in pair_indices:
+        for t in range(num_trainings):
+            g_ijt = 1 if availability[i][t] == 1 and availability[j][t] == 1 else 0
+            problem += x[i][t] - x[j][t] <= 1 - g_ijt
+            problem += x[j][t] - x[i][t] <= 1 - g_ijt
+
+    solver = pulp.PULP_CBC_CMD(msg=False)
+    problem.solve(solver)
+    if pulp.LpStatus[problem.status] != "Optimal":
+        raise ValueError(f"MILP did not solve optimally (status={pulp.LpStatus[problem.status]}).")
+
+    assignment = [
+        [int(pulp.value(x[i][t])) for t in range(num_trainings)]
+        for i in range(num_athletes)
+    ]
+    repeat_over_values = [float(pulp.value(repeat_over[i])) for i in range(num_athletes)]
+    return assignment, repeat_over_values
+
+
+def write_selected_trainings_csv(
+    trainings: Sequence[Training],
+    coaches_by_training: Optional[Sequence[str]] = None,
+) -> Path:
     output_path = RESULTS_DIR / "selected_trainings.csv"
     with output_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["training_id", "training_time", "participants", "n_participants"])
-        for training in trainings:
+        header = ["training_id", "training_time", "participants", "n_participants"]
+        if coaches_by_training is not None:
+            header.append("coach")
+        writer.writerow(header)
+        for idx, training in enumerate(trainings):
             participants = sorted(set(training.participants))
+            coach_name = ""
+            if coaches_by_training is not None:
+                if len(coaches_by_training) != len(trainings):
+                    raise ValueError("coaches_by_training must match the number of trainings.")
+                coach_name = coaches_by_training[idx]
+                if coach_name:
+                    coaches = {name.strip() for name in coach_name.split(";") if name.strip()}
+                    participants = [name for name in participants if name not in coaches]
             writer.writerow(
                 [
                     training.training_id,
                     training.training_time,
                     ";".join(participants),
                     len(participants),
+                    *([coach_name] if coaches_by_training is not None else []),
                 ]
             )
     return output_path
@@ -791,7 +879,7 @@ def write_diagnostics_csv(diagnostics: Dict[str, Dict[str, float]]) -> Path:
 
 def run_optimizer(args: argparse.Namespace) -> None:
     reset_results_dir()
-    k_limit = prompt_k()
+    k_limit = args.k if args.k is not None else prompt_k()
     if args.trainings:
         trainings_path = Path(args.trainings)
     else:
@@ -823,7 +911,7 @@ def run_optimizer(args: argparse.Namespace) -> None:
     athlete_names = sorted(
         set(mapw.keys()) | set(desired.keys()) | {p for t in trainings for p in t.participants}
     )
-    selected, diagnostics = greedy_optimize(
+    selected, diagnostics = solve_training_selection_milp(
         trainings=trainings,
         athletes=athlete_names,
         desired=desired,
@@ -835,7 +923,91 @@ def run_optimizer(args: argparse.Namespace) -> None:
         size_fn=args.size_fn,
         k_limit=k_limit,
     )
-    write_selected_trainings_csv(selected)
+    coaches_by_training: Optional[List[str]] = None
+    if selected:
+        availability = [
+            [1 if athlete in training.participants else 0 for training in selected]
+            for athlete in athlete_names
+        ]
+        one_training_only = [
+            1 if sum(availability[athlete_idx]) == 1 else 0
+            for athlete_idx in range(len(athlete_names))
+        ]
+        name_to_idx = {name: idx for idx, name in enumerate(athlete_names)}
+        max_priority = max((mapw.get(athlete, 0.0) for athlete in athlete_names), default=0.0)
+        lone_partner_bonus = max_priority + 1.0
+        pair_split_bonus = [
+            [0.0 for _ in range(len(selected))] for _ in range(len(athlete_names))
+        ]
+        pair_indices = []
+        for athlete_a, athlete_b in pairs:
+            in_a = athlete_a in name_to_idx
+            in_b = athlete_b in name_to_idx
+            if in_a and in_b:
+                i = name_to_idx[athlete_a]
+                j = name_to_idx[athlete_b]
+                pair_indices.append((i, j))
+                for t in range(len(selected)):
+                    if availability[i][t] == 1 and availability[j][t] == 0:
+                        pair_split_bonus[i][t] += lone_partner_bonus
+                    elif availability[i][t] == 0 and availability[j][t] == 1:
+                        pair_split_bonus[j][t] += lone_partner_bonus
+            elif in_a:
+                i = name_to_idx[athlete_a]
+                for t in range(len(selected)):
+                    if availability[i][t] == 1:
+                        pair_split_bonus[i][t] += lone_partner_bonus
+            elif in_b:
+                j = name_to_idx[athlete_b]
+                for t in range(len(selected)):
+                    if availability[j][t] == 1:
+                        pair_split_bonus[j][t] += lone_partner_bonus
+        coaches_required = [args.coaches_per_training for _ in selected]
+        if any(
+            coaches_required[idx]
+            > sum(availability[athlete_idx][idx] for athlete_idx in range(len(athlete_names)))
+            for idx in range(len(selected))
+        ):
+            raise ValueError("Not enough available athletes to satisfy coach demand.")
+        selected_mask = [1 for _ in selected]
+        try:
+            assignment, _ = solve_coaching_assignment_milp(
+                availability=availability,
+                coaches_required=coaches_required,
+                priority_scores=[mapw.get(athlete, 0.0) for athlete in athlete_names],
+                pair_split_bonus=pair_split_bonus,
+                alpha=args.coach_alpha,
+                mu_penalty=args.coach_mu,
+                repeat_over_penalty=args.coach_rho,
+                one_training_only=one_training_only,
+                pair_indices=pair_indices,
+                selected_mask=selected_mask,
+                strict_max_one=True,
+            )
+        except ValueError:
+            assignment, _ = solve_coaching_assignment_milp(
+                availability=availability,
+                coaches_required=coaches_required,
+                priority_scores=[mapw.get(athlete, 0.0) for athlete in athlete_names],
+                pair_split_bonus=pair_split_bonus,
+                alpha=args.coach_alpha,
+                mu_penalty=args.coach_mu,
+                repeat_over_penalty=args.coach_rho,
+                one_training_only=one_training_only,
+                pair_indices=pair_indices,
+                selected_mask=selected_mask,
+                strict_max_one=False,
+            )
+        coaches_by_training = []
+        for training_idx in range(len(selected)):
+            coaches = [
+                athlete_names[athlete_idx]
+                for athlete_idx in range(len(athlete_names))
+                if assignment[athlete_idx][training_idx] == 1
+            ]
+            coaches_by_training.append(";".join(sorted(coaches)))
+
+    write_selected_trainings_csv(selected, coaches_by_training)
     write_diagnostics_csv(diagnostics)
 
 
@@ -908,8 +1080,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     optimize_parser.add_argument("--k", type=int, help="Maximum number of trainings.")
     optimize_parser.add_argument("--alpha-scale", type=float, default=10.0)
     optimize_parser.add_argument("--delta-size", type=float, default=1.0)
-    optimize_parser.add_argument("--gamma-pair", type=float, default=2.0)
+    optimize_parser.add_argument("--gamma-pair", type=float, default=4.0)
     optimize_parser.add_argument("--size-fn", choices=["sqrt", "linear"], default="sqrt")
+    optimize_parser.add_argument(
+        "--coaches-per-training",
+        type=int,
+        default=1,
+        help="Number of coaches required per selected training.",
+    )
+    optimize_parser.add_argument("--coach-alpha", type=float, default=1.0)
+    optimize_parser.add_argument(
+        "--coach-mu",
+        type=float,
+        default=0.0,
+        help="Penalty for assigning one-training-only athletes as coaches.",
+    )
+    optimize_parser.add_argument(
+        "--coach-rho",
+        type=float,
+        default=1.0,
+        help="Penalty per coaching assignment above one per athlete.",
+    )
     optimize_parser.set_defaults(func=run_optimizer)
 
     return parser
